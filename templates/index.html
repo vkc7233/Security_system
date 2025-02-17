@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Recognition Security</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin: 20px;
+        }
+        video {
+            border: 2px solid black;
+            width: 60%;
+            max-width: 400px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px;
+            margin: 10px;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        input {
+            padding: 8px;
+            margin: 10px;
+            width: 200px;
+        }
+    </style>
+    <script>
+        let videoStream;
+        
+        function startCamera() {
+            navigator.mediaDevices.getUserMedia({ video: true })
+                .then(stream => {
+                    videoStream = stream;
+                    document.getElementById("video").srcObject = stream;
+                })
+                .catch(error => console.error("Error accessing camera:", error));
+        }
+
+        function stopCamera() {
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+            }
+        }
+
+        function captureAndSend() {
+    let nameInput = document.getElementById("name");
+
+    if (nameInput.value.trim() === "") {
+        alert("Please enter a name.");
+        return;
+    }
+
+    let video = document.getElementById("video");
+    let canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    let ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    canvas.toBlob(blob => {
+        let formData = new FormData();
+        formData.append("name", nameInput.value);
+        formData.append("image", blob, "captured.jpg");  // Ensure correct format
+
+        fetch("/capture_image", { method: "POST", body: formData })
+            .then(response => response.json())
+            .then(data => alert(data.status))
+            .catch(error => console.error("Error:", error));
+    }, "image/jpeg");
+}
+
+
+        function startSecurity() {
+            fetch("/start_security", { method: "POST" })
+                .then(response => response.json())
+                .then(data => alert(data.status))
+                .catch(error => console.error("Error:", error));
+        }
+
+        function stopSecurity() {
+            fetch("/stop_security", { method: "POST" })
+                .then(response => response.json())
+                .then(data => alert(data.status))
+                .catch(error => console.error("Error:", error));
+        }
+    </script>
+</head>
+<body onload="startCamera()">
+    <h1>Face Recognition Security System</h1>
+
+    <h2>Security Control</h2>
+    <button onclick="startSecurity()">Start Security Monitoring</button>
+    <button onclick="stopSecurity()">Stop Security Monitoring</button>
+
+    <h2>Add Known Person</h2>
+    <input type="text" id="name" placeholder="Enter Name" required>
+    <br>
+    <video id="video" autoplay></video>
+    <br>
+    <button onclick="captureAndSend()">Capture & Add Person</button>
+    <button onclick="stopCamera()">Stop Camera</button>
+</body>
+</html>
