@@ -1,180 +1,238 @@
-from flask import Flask, render_template, request, jsonify
+"""SiteGuard - face recognition site security for construction projects."""
+import csv
+import hmac
+import io
+import logging
 import os
+import uuid
+from datetime import date
+
 import cv2
-import face_recognition
-import sqlite3
 import numpy as np
-import threading
-import requests
+from flask import Flask, Response, abort, jsonify, render_template, request, send_from_directory
 
-app = Flask(__name__)
+from security.config import CATEGORIES, PROJECTS, SEVERITIES, Config
+from security.database import Database
+from security.engine import EnrolmentError, SecurityEngine, encode_single_face, face_recognition
+from security.notifier import TelegramNotifier
 
-# Security status
-security_active = False
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-# Telegram Bot Configuration
-BOT_TOKEN = "7646893440:AAGP5QCWLgJYZgXExtE19cuXcrc23vWSNSk"  # Replace with your bot token
-CHAT_ID = "1582728185"  # Replace with your chat ID
 
-# Database setup
-DB_PATH = "faces.db"
-KNOWN_FACES_DIR = "known_faces"
-os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+def create_app(cfg=Config):
+    app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = cfg.MAX_UPLOAD_MB * 1024 * 1024
+    os.makedirs(cfg.FACES_DIR, exist_ok=True)
+    os.makedirs(cfg.SNAPSHOT_DIR, exist_ok=True)
 
-def send_telegram_message(message):
-    """Sends a text alert to the Telegram bot."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": message}
-    response = requests.post(url, data=data)
-    if response.status_code == 200:
-        print("📩 Telegram message sent successfully!")
-    else:
-        print("❌ Failed to send message:", response.text)
+    db = Database(cfg.DB_PATH)
+    notifier = TelegramNotifier(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+    engine = SecurityEngine(db, notifier, cfg)
+    app.extensions["siteguard"] = {"db": db, "engine": engine, "notifier": notifier}
 
-def send_telegram_photo(photo_path):
-    """Sends a photo to the Telegram bot."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    with open(photo_path, "rb") as photo:
-        files = {"photo": photo}
-        data = {"chat_id": CHAT_ID}
-        response = requests.post(url, data=data, files=files)
-    if response.status_code == 200:
-        print("📸 Photo sent successfully!")
-    else:
-        print("❌ Failed to send photo:", response.text)
+    # ---- access control ---------------------------------------------------
+    @app.before_request
+    def require_login():
+        if not cfg.ADMIN_PASSWORD:
+            return None
+        auth = request.authorization
+        if auth and hmac.compare_digest(auth.username or "", cfg.ADMIN_USER) and \
+                hmac.compare_digest(auth.password or "", cfg.ADMIN_PASSWORD):
+            return None
+        return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="SiteGuard"'})
 
-def add_known_face(name, image_path):
-    """Encodes and stores a known face in the database."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS known_faces (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            encoding BLOB
-        )
-    """)
+    def error(msg, code=400):
+        return jsonify({"ok": False, "status": msg}), code
 
-    image = face_recognition.load_image_file(image_path)
-    face_encodings = face_recognition.face_encodings(image)
+    def read_image(file_storage):
+        data = np.frombuffer(file_storage.read(), dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if img is None:
+            raise EnrolmentError("Uploaded file is not a valid image.")
+        return img
 
-    if face_encodings:
-        encoding = face_encodings[0].tobytes()
-        cursor.execute("INSERT INTO known_faces (name, encoding) VALUES (?, ?)", (name, encoding))
-        conn.commit()
-        conn.close()
-        return True
-    return False
+    def enrol_sample(person_id, bgr, force=False):
+        """Validate, de-duplicate and store one face sample for a person."""
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        enc = encode_single_face(rgb)
+        if not force:
+            gallery, meta = db.load_gallery()
+            if gallery:
+                dists = face_recognition.face_distance(np.array(gallery), enc)
+                best = int(np.argmin(dists))
+                if dists[best] <= cfg.MATCH_TOLERANCE and meta[best]["id"] != person_id:
+                    raise EnrolmentError(
+                        f"This face already matches '{meta[best]['name']}' ({meta[best]['category']}). "
+                        "Duplicate enrolment blocked.")
+        filename = f"person_{person_id}_{uuid.uuid4().hex[:8]}.jpg"
+        cv2.imwrite(os.path.join(cfg.FACES_DIR, filename), bgr)
+        db.add_sample(person_id, enc, filename)
 
-def security_feed():
-    """Starts face recognition and sends Telegram alerts if an unknown face is detected."""
-    global security_active
-    security_active = True
+    # ---- pages ------------------------------------------------------------
+    @app.route("/")
+    def index():
+        return render_template("index.html", cfg=cfg, categories=CATEGORIES,
+                               projects=PROJECTS, severities=SEVERITIES)
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, encoding FROM known_faces")
-    data = cursor.fetchall()
-    conn.close()
+    @app.route("/video_feed")
+    def video_feed():
+        return Response(engine.mjpeg(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-    known_face_encodings = []
-    known_face_names = []
+    @app.route("/snapshots/<path:filename>")
+    def snapshot(filename):
+        return send_from_directory(cfg.SNAPSHOT_DIR, filename)
 
-    for name, encoding in data:
-        known_face_encodings.append(np.frombuffer(encoding, dtype=np.float64))
-        known_face_names.append(name)
+    @app.route("/faces/<path:filename>")
+    def face_image(filename):
+        return send_from_directory(cfg.FACES_DIR, filename)
 
-    detected_unknown_faces = []
-    video_capture = cv2.VideoCapture(0)
+    # ---- system -----------------------------------------------------------
+    @app.route("/api/status")
+    def api_status():
+        today = date.today().isoformat()
+        return jsonify({
+            "engine": engine.status(),
+            "stats": db.stats(today),
+            "on_site": db.on_site_now(cfg.ON_SITE_WINDOW_MIN),
+            "alerts": db.list_events(unacked_only=True, limit=20),
+            "site": {"name": cfg.SITE_NAME, "project": cfg.PROJECT_NAME,
+                     "work_hours": [cfg.WORK_START_HOUR, cfg.WORK_END_HOUR]},
+        })
 
-    while security_active:
-        ret, frame = video_capture.read()
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        face_locations = face_recognition.face_locations(rgb_frame)
-        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+    @app.route("/api/security/start", methods=["POST"])
+    @app.route("/start_security", methods=["POST"])
+    def start_security():
+        try:
+            started = engine.start()
+        except RuntimeError as exc:
+            return error(str(exc), 503)
+        return jsonify({"ok": True, "status": "Security armed" if started else "Already running"})
 
-        for face_encoding, face_location in zip(face_encodings, face_locations):
-            matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.5)
-            name = "Unknown"
+    @app.route("/api/security/stop", methods=["POST"])
+    @app.route("/stop_security", methods=["POST"])
+    def stop_security():
+        engine.stop()
+        return jsonify({"ok": True, "status": "Security disarmed"})
 
-            if True in matches:
-                first_match_index = matches.index(True)
-                name = known_face_names[first_match_index]
+    # ---- people -----------------------------------------------------------
+    @app.route("/api/persons")
+    def list_persons():
+        return jsonify(db.list_persons())
 
-            top, right, bottom, left = face_location
-            color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
-            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-            cv2.putText(frame, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-
-            if name == "Unknown":
-                is_new_person = True
-                for detected_face in detected_unknown_faces:
-                    if face_recognition.compare_faces([detected_face], face_encoding, tolerance=0.6)[0]:
-                        is_new_person = False
-                        break
-
-                if is_new_person:
-                    detected_unknown_faces.append(face_encoding)
-                    image_path = "unknown_face.jpg"
-                    cv2.imwrite(image_path, frame)
-
-                    send_telegram_message("🔔 Unknown Face Detected!")
-                    send_telegram_photo(image_path)
-
-        cv2.imshow("Security Feed", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    video_capture.release()
-    cv2.destroyAllWindows()
-    security_active = False
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-@app.route("/start_security", methods=["POST"])
-def start_security():
-    global security_active
-    if not security_active:
-        threading.Thread(target=security_feed).start()
-        return jsonify({"status": "Security started"})
-    return jsonify({"status": "Already running"})
-
-@app.route("/stop_security", methods=["POST"])
-def stop_security():
-    global security_active
-    security_active = False
-    return jsonify({"status": "Security stopped"})
-@app.route("/capture_image", methods=["POST"])
-def capture_image():
-    try:
-        # Check if name is provided
-        name = request.form.get("name")
+    @app.route("/api/persons", methods=["POST"])
+    @app.route("/capture_image", methods=["POST"])
+    def add_person():
+        name = (request.form.get("name") or "").strip()
+        category = request.form.get("category") or "Staff"
         if not name:
-            print("❌ Error: No name provided")
-            return jsonify({"status": "Name required"}), 400
+            return error("Name is required")
+        if len(name) > 80:
+            return error("Name is too long")
+        if category not in CATEGORIES:
+            return error("Invalid category")
+        images = request.files.getlist("image")
+        use_live = request.form.get("source") == "live"
+        if not images and not use_live:
+            return error("At least one photo is required")
+        try:
+            frames = [read_image(f) for f in images]
+            if use_live:
+                rgb = engine.latest_rgb()
+                if rgb is None:
+                    return error("Security camera is not running")
+                frames.append(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        except EnrolmentError as exc:
+            return error(str(exc))
 
-        # Check if image is provided
-        if "image" not in request.files:
-            print("❌ Error: No image received")
-            return jsonify({"status": "Image file required"}), 400
+        person_id = db.add_person(
+            name, category, request.form.get("project", ""), request.form.get("phone", ""),
+            request.form.get("notes", ""), request.form.get("valid_until") or None)
+        added, problems = 0, []
+        for i, bgr in enumerate(frames, 1):
+            try:
+                enrol_sample(person_id, bgr, force=request.form.get("force") == "1")
+                added += 1
+            except EnrolmentError as exc:
+                problems.append(f"Photo {i}: {exc}")
+            except RuntimeError as exc:
+                problems.append(str(exc))
+                break
+        if not added:
+            db.delete_person(person_id)
+            return error(" ".join(problems) or "Enrolment failed", 422)
+        engine.reload_gallery()
+        msg = f"{name} enrolled as {category} with {added} face sample(s)."
+        if problems:
+            msg += " Skipped: " + " ".join(problems)
+        return jsonify({"ok": True, "status": msg, "id": person_id})
 
-        file = request.files["image"]
+    @app.route("/api/persons/<int:person_id>/samples", methods=["POST"])
+    def add_samples(person_id):
+        if not db.get_person(person_id):
+            abort(404)
+        added, problems = 0, []
+        for i, f in enumerate(request.files.getlist("image"), 1):
+            try:
+                enrol_sample(person_id, read_image(f))
+                added += 1
+            except (EnrolmentError, RuntimeError) as exc:
+                problems.append(f"Photo {i}: {exc}")
+        engine.reload_gallery()
+        return jsonify({"ok": added > 0, "status": f"{added} sample(s) added. " + " ".join(problems)})
 
-        # Save the image
-        image_path = os.path.join(KNOWN_FACES_DIR, f"{name}.jpg")
-        file.save(image_path)
-        print(f"✅ Image saved at {image_path}")
+    @app.route("/api/persons/<int:person_id>", methods=["PATCH"])
+    def update_person(person_id):
+        if not db.get_person(person_id):
+            abort(404)
+        data = request.get_json(silent=True) or {}
+        if "category" in data and data["category"] not in CATEGORIES:
+            return error("Invalid category")
+        db.update_person(person_id, **data)
+        engine.reload_gallery()
+        return jsonify({"ok": True, "status": "Updated"})
 
-        # Encode and store the face
-        if add_known_face(name, image_path):
-            return jsonify({"status": f"{name} added successfully!"})
-        return jsonify({"status": "Failed to add person"}), 400
+    @app.route("/api/persons/<int:person_id>", methods=["DELETE"])
+    def delete_person(person_id):
+        for fname in db.delete_person(person_id):
+            path = os.path.join(cfg.FACES_DIR, os.path.basename(fname))
+            if os.path.exists(path):
+                os.remove(path)
+        engine.reload_gallery()
+        return jsonify({"ok": True, "status": "Person removed"})
 
-    except Exception as e:
-        print(f"❌ Server Error: {e}")
-        return jsonify({"status": f"Server error: {str(e)}"}), 500
+    # ---- events & register ------------------------------------------------
+    @app.route("/api/events")
+    def list_events():
+        return jsonify(db.list_events(
+            date=request.args.get("date") or None,
+            severity=request.args.get("severity") or None,
+            limit=min(request.args.get("limit", 200, type=int) or 200, 1000)))
+
+    @app.route("/api/events/<int:event_id>/ack", methods=["POST"])
+    def ack_event(event_id):
+        note = ((request.get_json(silent=True) or {}).get("note") or "")[:300]
+        db.ack_event(event_id, note)
+        return jsonify({"ok": True, "status": "Acknowledged"})
+
+    @app.route("/api/register")
+    def register():
+        day = request.args.get("date") or date.today().isoformat()
+        return jsonify({"date": day, "rows": db.site_register(day), "hourly": db.hourly_counts(day)})
+
+    @app.route("/api/register.csv")
+    def register_csv():
+        day = request.args.get("date") or date.today().isoformat()
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["Date", "Name", "Category", "Project", "First In", "Last Seen", "Hours On Site", "Sightings"])
+        for r in db.site_register(day):
+            w.writerow([day, r["name"], r["category"], r["project"], r["first_in"][11:16],
+                        r["last_seen"][11:16], r["hours_on_site"], r["sightings"]])
+        return Response(buf.getvalue(), mimetype="text/csv", headers={
+            "Content-Disposition": f"attachment; filename=site_register_{day}.csv"})
+
+    return app
+
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    create_app().run(host=Config.HOST, port=Config.PORT, debug=Config.DEBUG, threaded=True)

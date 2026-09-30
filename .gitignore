@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+snapshots/
+unknown_face.jpg
