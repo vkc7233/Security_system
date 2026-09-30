@@ -1,111 +1,235 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Face Recognition Security</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            text-align: center;
-            margin: 20px;
-        }
-        video {
-            border: 2px solid black;
-            width: 60%;
-            max-width: 400px;
-        }
-        button {
-            background-color: #4CAF50;
-            color: white;
-            padding: 10px;
-            margin: 10px;
-            border: none;
-            cursor: pointer;
-        }
-        button:hover {
-            background-color: #45a049;
-        }
-        input {
-            padding: 8px;
-            margin: 10px;
-            width: 200px;
-        }
-    </style>
-    <script>
-        let videoStream;
-        
-        function startCamera() {
-            navigator.mediaDevices.getUserMedia({ video: true })
-                .then(stream => {
-                    videoStream = stream;
-                    document.getElementById("video").srcObject = stream;
-                })
-                .catch(error => console.error("Error accessing camera:", error));
-        }
-
-        function stopCamera() {
-            if (videoStream) {
-                videoStream.getTracks().forEach(track => track.stop());
-            }
-        }
-
-        function captureAndSend() {
-    let nameInput = document.getElementById("name");
-
-    if (nameInput.value.trim() === "") {
-        alert("Please enter a name.");
-        return;
-    }
-
-    let video = document.getElementById("video");
-    let canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    let ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    canvas.toBlob(blob => {
-        let formData = new FormData();
-        formData.append("name", nameInput.value);
-        formData.append("image", blob, "captured.jpg");  // Ensure correct format
-
-        fetch("/capture_image", { method: "POST", body: formData })
-            .then(response => response.json())
-            .then(data => alert(data.status))
-            .catch(error => console.error("Error:", error));
-    }, "image/jpeg");
-}
-
-
-        function startSecurity() {
-            fetch("/start_security", { method: "POST" })
-                .then(response => response.json())
-                .then(data => alert(data.status))
-                .catch(error => console.error("Error:", error));
-        }
-
-        function stopSecurity() {
-            fetch("/stop_security", { method: "POST" })
-                .then(response => response.json())
-                .then(data => alert(data.status))
-                .catch(error => console.error("Error:", error));
-        }
-    </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SiteGuard | {{ cfg.PROJECT_NAME }}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23f5a524'/%3E%3Ctext x='16' y='22' font-size='14' font-family='sans-serif' font-weight='800' text-anchor='middle' fill='%231a1203'%3ESG%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
 </head>
-<body onload="startCamera()">
-    <h1>Face Recognition Security System</h1>
+<body data-ws="{{ cfg.WORK_START_HOUR }}" data-we="{{ cfg.WORK_END_HOUR }}">
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">SG</div>
+      <div>
+        <div class="brand-name">SiteGuard</div>
+        <div class="brand-sub">{{ cfg.PROJECT_NAME }}</div>
+      </div>
+    </div>
+    <nav>
+      <button class="nav-item active" data-view="monitor">Live Monitor</button>
+      <button class="nav-item" data-view="enrol">Enrol Person</button>
+      <button class="nav-item" data-view="people">People Directory</button>
+      <button class="nav-item" data-view="events">Event Log <span class="badge" id="nav-alerts" hidden>0</span></button>
+      <button class="nav-item" data-view="register">Site Register</button>
+      <button class="nav-item" data-view="muster">Emergency Muster</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="site-chip">
+        <span class="dot" id="side-dot"></span>
+        <span>{{ cfg.SITE_NAME }}</span>
+      </div>
+      <div class="muted small">Working hours {{ '%02d' % cfg.WORK_START_HOUR }}:00 – {{ '%02d' % cfg.WORK_END_HOUR }}:00</div>
+      <div class="muted small" id="clock"></div>
+    </div>
+  </aside>
 
-    <h2>Security Control</h2>
-    <button onclick="startSecurity()">Start Security Monitoring</button>
-    <button onclick="stopSecurity()">Stop Security Monitoring</button>
+  <main class="main">
+    <!-- ================= LIVE MONITOR ================= -->
+    <section class="view active" id="view-monitor">
+      <header class="view-head">
+        <div>
+          <h1>Live Monitor</h1>
+          <p class="muted">{{ cfg.PROJECT_NAME }} · {{ cfg.SITE_NAME }}</p>
+        </div>
+        <div class="arm-group">
+          <span class="status-pill" id="status-pill">Disarmed</span>
+          <button class="btn btn-arm" id="btn-arm">Arm System</button>
+        </div>
+      </header>
 
-    <h2>Add Known Person</h2>
-    <input type="text" id="name" placeholder="Enter Name" required>
-    <br>
-    <video id="video" autoplay></video>
-    <br>
-    <button onclick="captureAndSend()">Capture & Add Person</button>
-    <button onclick="stopCamera()">Stop Camera</button>
+      <div class="notice" id="engine-warning" hidden></div>
+
+      <div class="kpis">
+        <div class="kpi"><span class="kpi-label">Enrolled</span><span class="kpi-value" id="k-persons">0</span></div>
+        <div class="kpi"><span class="kpi-label">On site now</span><span class="kpi-value" id="k-onsite">0</span></div>
+        <div class="kpi"><span class="kpi-label">Entries today</span><span class="kpi-value" id="k-entries">0</span></div>
+        <div class="kpi"><span class="kpi-label">Unknown today</span><span class="kpi-value warn" id="k-unknown">0</span></div>
+        <div class="kpi"><span class="kpi-label">Open alerts</span><span class="kpi-value warn" id="k-open">0</span></div>
+        <div class="kpi"><span class="kpi-label">Critical today</span><span class="kpi-value crit" id="k-critical">0</span></div>
+      </div>
+
+      <div class="monitor-grid">
+        <div class="card feed-card">
+          <div class="card-head">
+            <h2>Camera Feed</h2>
+            <div class="feed-meta"><span id="m-fps">0 fps</span> · <span id="m-faces">0 faces</span> · <span id="m-cam">Camera idle</span></div>
+          </div>
+          <div class="feed">
+            <img id="feed" src="{{ url_for('video_feed') }}" alt="Live security camera feed">
+            <div class="rec" id="rec" hidden>REC</div>
+          </div>
+          <div class="legend">
+            <span><i class="sw low"></i>Authorised</span>
+            <span><i class="sw medium"></i>Unknown</span>
+            <span><i class="sw high"></i>After-hours / expired pass</span>
+            <span><i class="sw critical"></i>Blacklisted</span>
+          </div>
+        </div>
+
+        <div class="side-col">
+          <div class="card">
+            <div class="card-head"><h2>Open Alerts</h2><button class="btn btn-ghost btn-sm" data-goto="events">View all</button></div>
+            <ul class="alert-list" id="alert-list"><li class="empty">No open alerts</li></ul>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>On Site Now</h2><span class="muted small">last {{ cfg.ON_SITE_WINDOW_MIN }} min</span></div>
+            <ul class="people-mini" id="onsite-list"><li class="empty">Nobody recorded</li></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= ENROL ================= -->
+    <section class="view" id="view-enrol">
+      <header class="view-head">
+        <div><h1>Enrol Person</h1><p class="muted">Capture 3–5 photos from slightly different angles for reliable recognition.</p></div>
+      </header>
+      <div class="enrol-grid">
+        <form class="card form" id="enrol-form" autocomplete="off">
+          <label>Full name<input name="name" required maxlength="80" placeholder="e.g. Ramesh Patil"></label>
+          <div class="row">
+            <label>Category
+              <select name="category">
+                {% for c in categories %}<option>{{ c }}</option>{% endfor %}
+              </select>
+            </label>
+            <label>Project / site
+              <select name="project">
+                <option value="">— Not assigned —</option>
+                {% for p in projects %}<option>{{ p }}</option>{% endfor %}
+              </select>
+            </label>
+          </div>
+          <div class="row">
+            <label>Phone<input name="phone" maxlength="20" placeholder="Optional"></label>
+            <label>Access valid until<input type="date" name="valid_until"></label>
+          </div>
+          <label>Notes<textarea name="notes" rows="2" maxlength="300" placeholder="Contractor firm, gate pass no., reason for blacklist..."></textarea></label>
+          <div class="hint" id="cat-hint"></div>
+          <div class="samples" id="samples"></div>
+          <div class="actions">
+            <button type="submit" class="btn btn-primary" id="btn-enrol">Save Person</button>
+            <button type="button" class="btn btn-ghost" id="btn-clear">Clear photos</button>
+          </div>
+        </form>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Capture</h2>
+            <div class="seg">
+              <button class="seg-btn active" data-src="webcam" type="button">This device</button>
+              <button class="seg-btn" data-src="upload" type="button">Upload</button>
+            </div>
+          </div>
+          <div id="src-webcam">
+            <div class="cam-box"><video id="video" autoplay playsinline muted></video><div class="guide"></div></div>
+            <div class="actions">
+              <button class="btn btn-primary" id="btn-snap" type="button">Capture Photo</button>
+              <button class="btn btn-ghost" id="btn-cam" type="button">Start Camera</button>
+              <button class="btn btn-ghost" id="btn-live" type="button" title="Use the current frame from the armed security camera">Use Security Camera</button>
+            </div>
+          </div>
+          <div id="src-upload" hidden>
+            <label class="drop">
+              <input type="file" id="file-input" accept="image/*" multiple>
+              <span>Drop or choose clear, front-facing photos (JPG/PNG)</span>
+            </label>
+          </div>
+          <ul class="tips">
+            <li>One person in frame, face fully visible, no helmet visor or mask.</li>
+            <li>Even lighting — avoid strong backlight at the gate.</li>
+            <li>Duplicate faces are blocked automatically.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= PEOPLE ================= -->
+    <section class="view" id="view-people">
+      <header class="view-head">
+        <div><h1>People Directory</h1><p class="muted" id="people-count"></p></div>
+        <div class="filters">
+          <input type="search" id="people-search" placeholder="Search name or project">
+          <select id="people-cat"><option value="">All categories</option>{% for c in categories %}<option>{{ c }}</option>{% endfor %}</select>
+        </div>
+      </header>
+      <div class="people-grid" id="people-grid"></div>
+    </section>
+
+    <!-- ================= EVENTS ================= -->
+    <section class="view" id="view-events">
+      <header class="view-head">
+        <div><h1>Event Log</h1><p class="muted">Every detection with evidence snapshot</p></div>
+        <div class="filters">
+          <input type="date" id="ev-date">
+          <select id="ev-sev"><option value="">All severities</option>{% for s in severities %}<option>{{ s }}</option>{% endfor %}</select>
+          <button class="btn btn-ghost" id="ev-refresh">Refresh</button>
+        </div>
+      </header>
+      <div class="card table-card">
+        <table>
+          <thead><tr><th>Time</th><th>Evidence</th><th>Person</th><th>Category</th><th>Severity</th><th>Reason</th><th>Status</th></tr></thead>
+          <tbody id="ev-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ================= REGISTER ================= -->
+    <section class="view" id="view-register">
+      <header class="view-head">
+        <div><h1>Site Register</h1><p class="muted">Automatic attendance: first in, last seen and hours on site</p></div>
+        <div class="filters">
+          <input type="date" id="reg-date">
+          <a class="btn btn-ghost" id="reg-csv" href="#">Export CSV</a>
+          <button class="btn btn-ghost" onclick="window.print()">Print</button>
+        </div>
+      </header>
+      <div class="card">
+        <div class="card-head"><h2>Hourly Activity</h2><div class="legend"><span><i class="sw low"></i>Identified</span><span><i class="sw medium"></i>Unknown</span></div></div>
+        <div class="chart" id="reg-chart"></div>
+      </div>
+      <div class="kpis kpis-3" id="reg-summary"></div>
+      <div class="card table-card">
+        <table>
+          <thead><tr><th>#</th><th>Name</th><th>Category</th><th>Project</th><th>First In</th><th>Last Seen</th><th>Hours</th><th>Sightings</th></tr></thead>
+          <tbody id="reg-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ================= MUSTER ================= -->
+    <section class="view" id="view-muster">
+      <header class="view-head">
+        <div><h1>Emergency Muster</h1><p class="muted">Roll call of everyone seen in the last {{ cfg.ON_SITE_WINDOW_MIN }} minutes. Tick people off at the assembly point.</p></div>
+        <div class="filters"><button class="btn btn-ghost" id="muster-reset">Reset</button><button class="btn btn-ghost" onclick="window.print()">Print</button></div>
+      </header>
+      <div class="muster-bar card">
+        <div><span class="kpi-label">Expected</span><span class="kpi-value" id="mu-total">0</span></div>
+        <div><span class="kpi-label">Accounted</span><span class="kpi-value ok" id="mu-ok">0</span></div>
+        <div><span class="kpi-label">Missing</span><span class="kpi-value crit" id="mu-missing">0</span></div>
+        <div class="progress"><div id="mu-progress"></div></div>
+      </div>
+      <div class="muster-grid" id="muster-grid"></div>
+    </section>
+  </main>
+</div>
+
+<div class="modal" id="modal" hidden><div class="modal-body"><img id="modal-img" alt="Snapshot"><button class="btn btn-ghost" id="modal-close">Close</button></div></div>
+<div class="toasts" id="toasts"></div>
+
+<script>window.SG = { onSiteWindow: {{ cfg.ON_SITE_WINDOW_MIN }} };</script>
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
